@@ -6,13 +6,15 @@ RUN npm ci
 COPY application/ ./
 RUN npm run build && npm prune --omit=dev
 
-# Runtime stage: no compiler, no dev dependencies, runs as the unprivileged node user.
+# Runtime stage: no compiler, no dev dependencies, runs as the unprivileged node
+# user. The user id is numeric (1000 is the node user) so that Kubernetes can
+# check runAsNonRoot, which it cannot do for a user name.
 FROM node:24-alpine
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build --chown=node:node /app/package.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/build ./build
-USER node
+USER 1000:1000
 EXPOSE 3000
 CMD ["node", "build/index.js"]
