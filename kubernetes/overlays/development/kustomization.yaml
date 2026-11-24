@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: development
+resources:
+  - ../../base
+replicas:
+  - name: app
+    count: 1
+# The publish workflow rewrites newName and newTag on every image build.
+images:
+  - name: app
+    newName: europe-west3-docker.pkg.dev/PROJECT_ID/images/app
+    newTag: "unset"

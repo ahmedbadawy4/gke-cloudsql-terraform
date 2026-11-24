@@ -1,0 +1,33 @@
+# Throwaway pod for checking that the cluster can reach the Cloud SQL private
+# address. It is not part of the overlays, so Argo CD never deploys it. Apply it
+# by hand with kubectl and delete it when done.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sql-test-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 70
+    runAsGroup: 70
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: sql-client
+      image: postgres:16-alpine
+      command:
+        - sleep
+        - "3600"
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL

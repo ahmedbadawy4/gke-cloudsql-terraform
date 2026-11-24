@@ -1,14 +1,43 @@
-# TypeScript / Node / Express application instructions
-To run this application locally for testing purposes, follow these instructions:
+# Application
 
- 1. If you have `node`/`npm` installed (tested on node v16), `cd` into this `application` directory then skip to step 3
- 2. Install Docker and run `docker run -it -v $(pwd):/app -p 3000:3000 node:16 /bin/bash` then `cd /app`
- 3. Run `npm install`
- 4. Run `npm run start:dev`
- 5. Navigate to your `http://localhost:3000` in your browser
+A small Express service written in TypeScript. It is the workload for the GKE and Cloud SQL setup in the root of this repository.
 
-For more production-like purposes, you can build the application using the following steps:
+## Run it locally
 
- 1. `npm run build`
- 2. Built files output to `./build` directory
- 3. Run `node build/index.js` to run the Express server
+You need Node.js 24.
+
+```bash
+npm ci
+npm run start:dev
+```
+
+Open `http://localhost:3000`. `nodemon` restarts the server when a file changes.
+
+## Build and run the compiled code
+
+```bash
+npm run build
+npm start
+```
+
+`npm run build` writes the JavaScript to `build/`. `npm start` runs `build/index.js`.
+
+## Endpoints
+
+| Path | Answer |
+| --- | --- |
+| `/` | A plain text message |
+| `/healthz` | `200` with `{"status":"ok"}`. Used as the liveness probe. |
+| `/readyz` | `200` with `{"status":"ready"}`, and `503` after the process gets SIGTERM. Used as the readiness probe. |
+| `/users/:userId` | The path parameters as JSON |
+| any other path | `404` with `{"error":"not found"}` |
+
+Requests are logged to the console. The two health paths are not logged.
+
+## Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT` | `3000` | Port the server listens on |
+
+On SIGTERM the server stops reporting ready, finishes open requests and exits.

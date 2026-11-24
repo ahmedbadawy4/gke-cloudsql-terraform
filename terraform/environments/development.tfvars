@@ -1,0 +1,9 @@
+environment           = "development"
+region                = "europe-west3"
+regional_cluster      = false
+node_machine_type     = "e2-medium"
+node_min_count        = 1
+node_max_count        = 2
+sql_tier              = "db-f1-micro"
+sql_availability_type = "ZONAL"
+deletion_protection   = false

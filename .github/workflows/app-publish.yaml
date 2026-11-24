@@ -1,34 +1,86 @@
-name: Publish Docker Image to GCR
+name: Publish image
+
+# Builds the application image, pushes it to Artifact Registry and commits the
+# new tag to the Kustomize overlay. Argo CD sees that commit and rolls it out.
+# Branch dev publishes to development, branch main to production.
 
 on:
   push:
     branches:
       - main
       - dev
-permissions: read-all
+    paths:
+      - application/**
+      - Dockerfile
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    runs-on: ubuntu-latest # Prefer self-hosted runners for secure builds
-
+  target:
+    name: Pick the environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.pick.outputs.environment }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Authenticate with GCP
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      - id: pick
         run: |
-          echo "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}" > gcloud-key.json
-          gcloud auth activate-service-account --key-file=gcloud-key.json
-          gcloud auth configure-docker gcr.io --quiet
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=development" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Build Docker image
-        run: |
-          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/sisu-tech:latest .
+  publish:
+    name: Build, push and update the overlay (${{ needs.target.outputs.environment }})
+    needs: target
+    runs-on: ubuntu-latest
+    environment: ${{ needs.target.outputs.environment }}
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      ENVIRONMENT: ${{ needs.target.outputs.environment }}
+      REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/images/app
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Push Docker image
+      - name: Authenticate to Google Cloud with Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.PUBLISH_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Point the overlay at the new image and commit
         run: |
-          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/sisu-tech:latest
+          file="kubernetes/overlays/${ENVIRONMENT}/kustomization.yaml"
+          sed -i -E \
+            -e "s|^( *newName:).*|\1 ${IMAGE}|" \
+            -e "s|^( *newTag:).*|\1 \"${GITHUB_SHA}\"|" \
+            "$file"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$file"
+          git commit -m "Deploy ${ENVIRONMENT}: image ${GITHUB_SHA::7}"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

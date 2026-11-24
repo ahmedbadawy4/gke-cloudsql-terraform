@@ -1,0 +1,9 @@
+environment           = "production"
+region                = "europe-west3"
+regional_cluster      = true
+node_machine_type     = "e2-standard-2"
+node_min_count        = 1
+node_max_count        = 2
+sql_tier              = "db-custom-1-3840"
+sql_availability_type = "REGIONAL"
+deletion_protection   = true

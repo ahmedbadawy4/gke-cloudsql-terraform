@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    name: Pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Run the hooks
+        run: |
+          pip install pre-commit
+          pre-commit run --all-files --show-diff-on-failure
+
+  application:
+    name: Application and image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: application/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: application
+
+      - name: Compile the TypeScript
+        run: npm run build
+        working-directory: application
+
+      - name: Build the container image
+        run: docker build --tag app:ci .
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Check the formatting
+        run: terraform fmt -check -recursive -diff
+
+      - name: Initialise without the remote state
+        run: terraform init -backend=false
+
+      - name: Validate
+        run: terraform validate
+
+      # Advisory: findings are shown in the log but do not fail the job.
+      - name: Scan with Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: true
+
+  kubernetes:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render both overlays
+        run: |
+          mkdir rendered
+          kubectl kustomize kubernetes/overlays/development > rendered/development.yaml
+          kubectl kustomize kubernetes/overlays/production > rendered/production.yaml
+
+      - name: Validate the manifests with kubeconform
+        run: |
+          docker run --rm -v "$PWD:/work:ro" ghcr.io/yannh/kubeconform:v0.7.0 \
+            -strict -summary -kubernetes-version 1.33.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /work/rendered /work/kubernetes/tools /work/argocd

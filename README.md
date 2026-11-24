@@ -1,115 +1,263 @@
-# app-work
-Monorepo for deploying TypeScript app on Google kubernetes cluster GKE.
+# GKE and Cloud SQL on Google Cloud with Terraform and Argo CD
 
-## Overview
-The application is simply a proof of concept (minimal version) of a complete project of running an application on Google Cloud Kubernetes Engine with a private connection to SQL Server in two environments [development, and production]
+A reference setup that runs a small TypeScript service on Google Kubernetes Engine (GKE) with a private connection to Cloud SQL for PostgreSQL. It has two environments, `development` and `production`.
 
-*Note: the CI/CD part has not been tested but it is very close to being correct after testing with some tweaks*
+- Terraform builds the network, the cluster, the database and the image registry.
+- GitHub Actions checks the code, builds the image and pushes it to Artifact Registry.
+- Argo CD pulls the Kubernetes manifests from this repository and keeps the cluster in sync.
 
-## Features
-- type script application.
-- Dockerfile.
-- CI/CD.
-- kubernetes manifest files.
-- Infrastructure as Code.
+This repository is a reference setup. It shows the structure and the decisions. It is not a ready production platform, and the [design limits](#design-limits) below say what is left out on purpose.
 
-### Prerequisites
-- Terraform cloud organization and two workspaces (development and production)
-- Google Cloud project pre-created.
-- Self-hosted runner with cloud access to create resources and publish to GCR and argocd access.
-- Google Container Registry (GCR) pre-installed.
+The Terraform code was first written with the Cloud Development Kit for Terraform (CDKTF). HashiCorp sunset CDKTF on 10 December 2025, so the code is now plain Terraform (HCL), which is the migration path HashiCorp documents.
 
-### Usage
-1. Infrastructure deployment:
-- Run the Github action pipeline named `infrastructure Deploy`, described in the `infra-deploy.yaml` file.
+## What Terraform creates
 
-    *Notes:*
+- A custom VPC network with one subnet. The subnet has secondary ranges for pods and services, and flow logs are on.
+- Private services access (a VPC peering) so Cloud SQL gets a private address.
+- Firewall rules: traffic inside the network, and SSH to nodes only from the Identity-Aware Proxy range.
+- A GKE cluster, zonal in development and regional in production:
+  - VPC-native, release channel `REGULAR`, Calico network policy enabled.
+  - A separate autoscaling node pool with shielded nodes. The default node pool is removed.
+  - A custom node service account with only the roles the nodes need, plus read access to the image repository.
+  - Optional `master_authorized_cidrs` to limit who can reach the Kubernetes API.
+- Cloud SQL for PostgreSQL 16:
+  - Private IP only, no public address.
+  - TLS with a client certificate required.
+  - Backups with point-in-time recovery, and a fixed list of logging flags.
+  - Deletion protection, off in development and on in production.
+- An Artifact Registry Docker repository named `images`.
 
-    *-  The pipeline will auto trigger in pull-request open for the branches dev and main.*
+## Repository layout
 
-    *- Assuming the branch main targets the production and the branch dev targets the development environment.*
+```text
+.
+├── application/          Express service in TypeScript
+├── Dockerfile            Multi-stage build, Node 24, runs as the node user
+├── kubernetes/
+│   ├── base/             Deployment, Service and NetworkPolicy
+│   ├── overlays/         development and production (namespace, replicas, image tag)
+│   └── tools/            sql-test-pod.yaml, applied by hand only
+├── argocd/               One Argo CD Application per environment
+├── terraform/            Network, GKE, Cloud SQL, IAM and Artifact Registry
+│   └── environments/     development.tfvars and production.tfvars
+└── .github/workflows/    ci.yaml, terraform-deploy.yaml, app-publish.yaml
+```
 
-    *- The deploy job only runs with the despatch, push to dev, or push to main.*
+## Environments and branches
 
-    *- In real cases there should be some approval interactions in the GitHub environments to limit the unwanted auto-deployment to the production environments.*
+| Environment | Git branch | Kubernetes namespace | Terraform state prefix |
+| --- | --- | --- | --- |
+| development | `dev` | `development` | `gke-cloudsql/development` |
+| production | `main` | `production` | `gke-cloudsql/production` |
 
+The setup assumes one Google Cloud project per environment. Repeat the one-time steps below in each project. The Argo CD application of an environment follows its branch, so a change on `dev` reaches development first and reaches production after you merge it into `main`.
 
-2. Publish the application image:
+## One-time setup per project
 
-- Run the Github action pipeline name `Publish Docker Image to GCR` described in the `app-publish.yaml` file.
+The commands use these shell variables. Set them for the project you are preparing.
 
-    *Notes:*
+```bash
+export PROJECT_ID=<google-cloud-project-id>
+export PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+export REGION=europe-west3
+export STATE_BUCKET=<globally-unique-bucket-name>
+export REPO=ahmedbadawy4/gke-cloudsql-terraform   # owner/name of this repository on GitHub
+```
 
-    *- The image should be published for use across all environments as a best practice. assuming one GCR is hosting images in all the environments.*
+1. Enable the APIs that Terraform and the pipelines use:
 
-    *- The pipeline I used basic authentication to Google Cloud, in real case a pre-configured self-hosted runner should be a better option.*
+   ```bash
+   gcloud services enable --project "$PROJECT_ID" \
+     compute.googleapis.com container.googleapis.com sqladmin.googleapis.com \
+     servicenetworking.googleapis.com iam.googleapis.com iamcredentials.googleapis.com \
+     sts.googleapis.com cloudresourcemanager.googleapis.com artifactregistry.googleapis.com
+   ```
 
-3. application deployment:
+2. Create the bucket that holds the Terraform state, with versioning on:
 
-- After deploying the infra and publishing the docker image we can install the application to the the new kubernetes cluster using ArgoCD.
+   ```bash
+   gcloud storage buckets create "gs://$STATE_BUCKET" --project "$PROJECT_ID" \
+     --location "$REGION" --uniform-bucket-level-access
+   gcloud storage buckets update "gs://$STATE_BUCKET" --versioning
+   ```
 
-    a. Assuming the argoCD is running in the same cluster. Or edit the files in the `argocd` directory with the correct ArgoCD server configuration.
+3. Create the service account that Terraform runs as, and give it its roles:
 
-    b. Run the Github action pipeline name `Deploy to Kubernetes` described in the `app-deploy.yaml` file.
+   ```bash
+   gcloud iam service-accounts create terraform-deployer --project "$PROJECT_ID"
+   export TF_SA="terraform-deployer@$PROJECT_ID.iam.gserviceaccount.com"
 
-    *Notes:*
+   for role in compute.networkAdmin compute.securityAdmin container.admin cloudsql.admin \
+     iam.serviceAccountAdmin iam.serviceAccountUser resourcemanager.projectIamAdmin \
+     servicenetworking.networksAdmin artifactregistry.admin; do
+     gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+       --member "serviceAccount:$TF_SA" --role "roles/$role" --condition=None
+   done
 
-    *-  The pipeline will auto trigger in pull-request open for the branches dev and main.*
+   gcloud storage buckets add-iam-policy-binding "gs://$STATE_BUCKET" \
+     --member "serviceAccount:$TF_SA" --role roles/storage.objectAdmin
+   ```
 
-    *- Assuming the branch main targets the production and the branch dev targets the development environment.*
+4. Create the service account that publishes images. Its only role is writing to the image repository, which Terraform creates, so grant it after the first Terraform apply (see [Deploy the infrastructure](#deploy-the-infrastructure)):
 
-    *- The deploy job only runs with the despatch, push to dev, or push to main.*
+   ```bash
+   gcloud iam service-accounts create image-publisher --project "$PROJECT_ID"
+   export PUBLISH_SA="image-publisher@$PROJECT_ID.iam.gserviceaccount.com"
+   ```
 
-    *- In real cases there should be some approval interactions in the GitHub environments to limit the unwanted auto-deployment to the production environments.*
+5. Let GitHub Actions sign in without a key file, with Workload Identity Federation. The condition limits the provider to this repository:
 
-4. pre-commit.
-- This part was added to enhance the code quality and limit syntax and style errors.
-- Pipeline as a checkpoint for the raised Pull Requests?
+   ```bash
+   gcloud iam workload-identity-pools create github --project "$PROJECT_ID" \
+     --location global --display-name "GitHub Actions"
 
-## Local run
-### Prerequisites
-- Node.js (LTS version recommended)
-- Docker
-- Terraform
-- terraform cloud account with Organization and workspace.
-- Google Cloud project ID
-- Python (>=3.7), pip (Python package manager)
+   gcloud iam workload-identity-pools providers create-oidc github --project "$PROJECT_ID" \
+     --location global --workload-identity-pool github \
+     --issuer-uri "https://token.actions.githubusercontent.com" \
+     --attribute-mapping "google.subject=assertion.sub,attribute.repository=assertion.repository" \
+     --attribute-condition "assertion.repository == '$REPO'"
 
-1. Run the application (Mac OS): (in application directory)
+   for sa in "$TF_SA" "$PUBLISH_SA"; do
+     gcloud iam service-accounts add-iam-policy-binding "$sa" --project "$PROJECT_ID" \
+       --role roles/iam.workloadIdentityUser \
+       --member "principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/github/attribute.repository/$REPO"
+   done
+   ```
 
-    a. Check TypeScript Installation: Ensure TypeScript is installed as a dependency `npm install typescript --save-dev`
+6. In the GitHub repository, create the Environments `development` and `production` (Settings, Environments). Add these variables to each one, with the values of its own project. For `production`, add required reviewers so a person approves every run.
 
-    b. Debug Errors: Run tsc directly to see detailed error output `npx tsc`
+   | Variable | Value |
+   | --- | --- |
+   | `GCP_PROJECT_ID` | The project ID |
+   | `GCP_REGION` | The region, `europe-west3` by default |
+   | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github/providers/github` |
+   | `TF_SERVICE_ACCOUNT` | The value of `$TF_SA` |
+   | `PUBLISH_SERVICE_ACCOUNT` | The value of `$PUBLISH_SA` |
+   | `TF_STATE_BUCKET` | The state bucket name |
 
-    c. Node Modules: Ensure dependencies are installed `npm install`
+   The region default is set in `terraform/variables.tf` and in the two `.tfvars` files. If you change it, change `GCP_REGION` and the registry host in `kubernetes/overlays/*/kustomization.yaml` to match.
 
-    d. Build the application `node build/index.js`.
-      this will pop up a message `Express server is listening at 3000` which means the application exposed on localhost:3000
+## Deploy the infrastructure
 
-2. Build a docker image (local)
+Run the workflow `Terraform deploy` from the Actions tab. Choose the environment and leave `apply` off to see the plan. Run it again with `apply` on to create the resources.
 
-    a. Buld the docker image `docker build -t sisu-tech .`
+To run Terraform from your own machine instead:
 
-    b. Run the image on port 3000 `docker run -p 3000:3000 sisu-tech`
+```bash
+cd terraform
+terraform init \
+  -backend-config="bucket=$STATE_BUCKET" \
+  -backend-config="prefix=gke-cloudsql/development"
+terraform plan -var-file=environments/development.tfvars -var="project_id=$PROJECT_ID"
+terraform apply -var-file=environments/development.tfvars -var="project_id=$PROJECT_ID"
+```
 
-3. Deploy infra using terraform CDK (in terraform directory)
+After the first `init`, commit the generated `terraform/.terraform.lock.hcl` so every run uses the same provider versions.
 
-    a. Install cdktf `npm install -g cdktf-cli`
+When the apply has finished, allow the publisher to push images:
 
-    b. Run `cdktf synth` to generate Terraform JSON configurations.
+```bash
+gcloud artifacts repositories add-iam-policy-binding images \
+  --project "$PROJECT_ID" --location "$REGION" \
+  --member "serviceAccount:$PUBLISH_SA" --role roles/artifactregistry.writer
+```
 
-    b. Run `cdktf diff --var environment=<environment_name> --var project_id=<project_ID>` to display the planned changes
+## Install Argo CD and the application
 
-    c. Terraform apply `cdktf diff --var environment=<environment_name> --var project_id=<project_ID>` to deploy the infra.
+Connect to the cluster. The name and location come from the Terraform outputs:
 
-4. Contribution
+```bash
+gcloud container clusters get-credentials "$(terraform -chdir=terraform output -raw cluster_name)" \
+  --project "$PROJECT_ID" --location "$(terraform -chdir=terraform output -raw cluster_location)"
+```
 
-    a. Install pre-commit `pip install pre-commit`.
+Install Argo CD, then create the Application of the environment:
 
-    b. in the root directory Run `pre-commit install`
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.6.2/manifests/install.yaml
+kubectl apply -f argocd/development.yaml     # or argocd/production.yaml
+```
 
-    c. Commit changes `git commit -m "Your commit message"`
+The Application reads this repository over HTTPS, so the repository must be public or Argo CD must have credentials for it.
 
-    d. Run `pre-commit run --all-files` to check the changes.
+## Publish an image
 
-    c. Bypass ( not recommended) Run `git commit --no-verify`
+The workflow `Publish image` runs on every push to `dev` or `main` that changes `application/` or the `Dockerfile`. It can also be started by hand. It does these steps:
+
+1. Picks the environment from the branch (`dev` is development, `main` is production).
+2. Signs in to Google Cloud with Workload Identity Federation.
+3. Builds the image and pushes it to Artifact Registry, tagged with the commit SHA.
+4. Writes the new image name and tag into `kubernetes/overlays/<environment>/kustomization.yaml` and commits that change to the same branch.
+
+Argo CD sees the commit and rolls out the new image. The overlay starts with the tag `unset`, so the first sync waits for the first published image.
+
+The commit in step 4 changes only the overlay file, which is not in the workflow's path filter, so it does not start another publish run.
+
+## Connect to Cloud SQL
+
+Cloud SQL has no public address and requires a client certificate. To check that the cluster can reach it, use the throwaway pod:
+
+```bash
+kubectl apply -f kubernetes/tools/sql-test-pod.yaml
+kubectl exec sql-test-pod -- pg_isready -h "$(terraform -chdir=terraform output -raw sql_private_ip)"
+kubectl delete -f kubernetes/tools/sql-test-pod.yaml
+```
+
+`pg_isready` shows that the server is reachable. To run queries, connect through the Cloud SQL Auth Proxy (the connection name is the output `sql_connection_name`) or with a client certificate.
+
+## Run the application locally
+
+You need Node.js 24. Details are in [application/README.md](application/README.md).
+
+```bash
+cd application
+npm ci
+npm run start:dev
+```
+
+To build the image:
+
+```bash
+docker build --tag app .
+docker run --rm -p 3000:3000 app
+```
+
+## Checks
+
+Pull requests and pushes to `dev` and `main` run `ci.yaml`:
+
+| Job | What it does |
+| --- | --- |
+| Pre-commit | Runs the hooks in `.pre-commit-config.yaml`: whitespace, YAML and JSON syntax, private-key detection, Hadolint and `terraform fmt`. |
+| Application and image | `npm ci`, `npm run build` and `docker build`. |
+| Terraform | `terraform fmt -check`, `init -backend=false` and `validate`, plus a Checkov scan that reports findings without failing the job. |
+| Kubernetes manifests | Renders both overlays with Kustomize and validates them, and the Argo CD applications, with kubeconform. |
+
+To run the hooks on your machine:
+
+```bash
+pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+## Design limits
+
+These are choices a reference setup makes. A production platform would change them.
+
+- **Database access:** Pods reach Cloud SQL through the node service account, which has `roles/cloudsql.client`. The next step is Workload Identity, so each workload gets its own identity. The cluster does not enable it yet.
+- **Nodes:** Nodes have public IP addresses. The next step is a private cluster with Cloud NAT.
+- **API endpoint:** With the default empty `master_authorized_cidrs`, the Kubernetes API endpoint accepts connections from any address. Set the list to your own ranges.
+- **Database contents:** Terraform creates the instance and one database. Database users and passwords are created separately.
+- **Audit logging:** Cloud SQL for PostgreSQL does not accept the pgaudit flags, so only the logging flags in `terraform/sql.tf` are set.
+- **Public service:** The Kubernetes Service is a public load balancer on port 80.
+- **Promotion:** Each environment builds its own image from its own branch. There is no step that promotes the same image from development to production.
+- **Application:** The service does not use the database. It exists to show the deployment path.
+- **Image bump commit:** The publish workflow pushes a commit to the branch. A protected `main` branch needs a pull request flow or an exception for the workflow.
+- **Cloud SQL names:** Google keeps the name of a deleted Cloud SQL instance reserved for about a week. Recreating an environment right after destroying it needs a different `name_prefix`.
+- **Node counts:** `node_min_count` and `node_max_count` apply per zone, so the regional production cluster runs up to three times that number of nodes.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

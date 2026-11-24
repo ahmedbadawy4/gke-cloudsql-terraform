@@ -1,14 +1,14 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: sisu-tech-production
+  name: app-production
   namespace: argocd
 spec:
   project: default
   source:
-    repoURL: https://github.com/ahmedbadawy4/app-work.git
-    targetRevision: HEAD
-    path: k8s/production
+    repoURL: https://github.com/ahmedbadawy4/gke-cloudsql-terraform.git
+    targetRevision: main
+    path: kubernetes/overlays/production
   destination:
     server: https://kubernetes.default.svc
     namespace: production
@@ -17,4 +17,4 @@ spec:
       prune: true
       selfHeal: true
     syncOptions:
-    - CreateNamespace=true
+      - CreateNamespace=true
