@@ -185,7 +185,7 @@ The Application reads this repository over HTTPS, so the repository must be publ
 
 The workflow `Publish image` runs on every push to `dev` or `main` that changes `application/` or the `Dockerfile`. It can also be started by hand. It does these steps:
 
-1. Picks the environment from the branch (`dev` is development, `main` is production).
+1. Picks the environment from the branch (`dev` is development, `main` is production). If the variables from [One-time setup per project](#one-time-setup-per-project) are not set in that environment, the run ends with a notice and publishes nothing.
 2. Signs in to Google Cloud with Workload Identity Federation.
 3. Builds the image and pushes it to Artifact Registry, tagged with the commit SHA.
 4. Writes the new image name and tag into `kubernetes/overlays/<environment>/kustomization.yaml` and commits that change to the same branch.
